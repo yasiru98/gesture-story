@@ -1,7 +1,9 @@
 import { useEffect, useRef } from 'react';
+import * as tf from '@tensorflow/tfjs-core';
 import '@tensorflow/tfjs-backend-webgl';
 import * as poseDetection from '@tensorflow-models/pose-detection';
-import { detectGesture } from '../ai/heuristics';
+import type { Pose } from '@tensorflow-models/pose-detection';
+import { detectGesture } from '../ai/heuristics'; // your file
 
 export default function DebugPose() {
   const videoRef  = useRef<HTMLVideoElement>(null);
@@ -9,84 +11,97 @@ export default function DebugPose() {
 
   useEffect(() => {
     let detector: poseDetection.PoseDetector | null = null;
+    let raf = 0;
 
     (async () => {
-      /* webcam stream */
-      const stream = await navigator.mediaDevices.getUserMedia({ video: true });
-      if (videoRef.current) videoRef.current.srcObject = stream;
+      // Backend
+      await tf.setBackend('webgl');
+      await tf.ready();
 
-      /* MoveNet */
+      // Camera
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: 'user' } // OK on laptops too
+      });
+      const video = videoRef.current!;
+      video.srcObject = stream;
+
+      await new Promise<void>(res => {
+        const onMeta = () => { video.removeEventListener('loadedmetadata', onMeta); res(); };
+        if (video.readyState >= 1) res(); else video.addEventListener('loadedmetadata', onMeta);
+      });
+      await video.play();
+
+      // Canvas size = video pixels 1:1 mapping to avoid overlay/sizing/placement issues
+      const W = video.videoWidth;
+      const H = video.videoHeight;
+      const canvas = canvasRef.current!;
+      canvas.width = W;
+      canvas.height = H;
+
+      // movenet integration
       detector = await poseDetection.createDetector(
         poseDetection.SupportedModels.MoveNet,
         { modelType: poseDetection.movenet.modelType.SINGLEPOSE_LIGHTNING }
       );
 
+      const ctx = canvas.getContext('2d')!;
+
       const loop = async () => {
-        const video  = videoRef.current;
-        const canvas = canvasRef.current;
-        if (!video || !canvas || video.readyState !== 4 || !detector) {
-          requestAnimationFrame(loop);
-          return;
-        }
+        // 1draw the current video frame
+        ctx.drawImage(video, 0, 0, W, H);
 
-        /* keep canvas buffer same as element size */
-        if (
-          canvas.width  !== canvas.clientWidth ||
-          canvas.height !== canvas.clientHeight
-        ) {
-          canvas.width  = canvas.clientWidth;
-          canvas.height = canvas.clientHeight;
-        }
+        // estimate pose (no flipping)
+        const poses = await detector!.estimatePoses(video);
+        const pose: Pose | undefined = poses[0];
 
-        /* scale factors: model-space to canvas-space */
-        const sx = canvas.width  / video.videoWidth;
-        const sy = canvas.height / video.videoHeight;
-
-        const ctx = canvas.getContext('2d')!;
-        const [pose] = await detector.estimatePoses(video);
-
-        ctx.clearRect(0, 0, canvas.width, canvas.height);
-        pose.keypoints.forEach(k => {
-          if (k.score! > 0.5) {
-            ctx.fillStyle = '#22d3ee';
-            ctx.beginPath();
-            ctx.arc(k.x * sx, k.y * sy, 5, 0, Math.PI * 2);
-            ctx.fill();
+        // overlay keypoints
+        if (pose) {
+          ctx.fillStyle = '#22d3ee';
+          for (const k of pose.keypoints) {
+            if ((k.score ?? 0) > 0.5 && k.x != null && k.y != null) {
+              ctx.beginPath();
+              ctx.arc(k.x, k.y, 5, 0, Math.PI * 2);
+              ctx.fill();
+            }
           }
-        });
 
-        const label = detectGesture(pose);
-        if (label) console.log(label);
+          // heuristics
+          const label = detectGesture(pose);
+          if (label) {
+            console.log('Gesture:', label);
+            ctx.font = '16px system-ui, sans-serif';
+            const text = `Gesture: ${label}`;
+            const pad = 8;
+            const w = ctx.measureText(text).width + pad * 2;
+            const h = 26;
+            ctx.fillStyle = 'rgba(0,0,0,0.6)';
+            ctx.fillRect(10, 10, w, h);
+            ctx.fillStyle = '#fff';
+            ctx.fillText(text, 10 + pad, 10 + h - 8);
+          }
+        }
 
-        requestAnimationFrame(loop);
+        raf = requestAnimationFrame(loop);
       };
+
       loop();
     })();
 
-    return () => detector?.dispose();
+    return () => {
+      if (raf) cancelAnimationFrame(raf);
+      detector?.dispose();
+      const v = videoRef.current;
+      const s = (v?.srcObject as MediaStream) || null;
+      s?.getTracks().forEach(t => t.stop());
+    };
   }, []);
 
-  /* centred  wrapper */
   return (
-    <div className="min-h-screen grid place-items-center bg-zinc-900">
-      <div
-        className="relative"
-        style={{
-          width:  'min(75vw, 1080px)',
-          height: 'min(calc(75vw * 0.75), 810px)' // 4:3 aspect
-        }}
-      >
-        <video
-          ref={videoRef}
-          className="absolute inset-0 w-full h-full object-cover bg-black"
-          autoPlay
-          muted
-        />
-        <canvas
-          ref={canvasRef}
-          className="absolute inset-0 w-full h-full pointer-events-none"
-        />
-      </div>
+    <div style={{ minHeight: '100vh', display: 'grid', placeItems: 'center', background: '#18181b' }}>
+      {/* hidden video drawn onto the canvas each frame */}
+      <video ref={videoRef} autoPlay muted playsInline style={{ display: 'none' }} />
+      {/* responsive display sizing while keeping internal pixels 1:1 to video pixels */}
+      <canvas ref={canvasRef} style={{ width: 'min(75vw, 1080px)', height: 'auto', boxShadow: '0 0 0 1px #2a2a2a' }} />
     </div>
   );
 }
