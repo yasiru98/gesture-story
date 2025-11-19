@@ -1,11 +1,10 @@
-// import { useState } from 'react'
 import './App.css'
-import DebugPose from './pages/DebugPose';
+
+import GestureStory  from './pages/GestureStory';
+import LiveQuickTest from './pages/LiveQuickTest';
 
 function App() {
-  // const [count, setCount] = useState(0)
-
-  return <DebugPose />; 
+  return <GestureStory />;
 }
 
-export default App
+export default App;
