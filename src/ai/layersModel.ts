@@ -99,20 +99,20 @@ class SeqBuf {
   }
 }
 
-// --- Simple movement-based idle detector -------------------------------
-function detectIdle(kps: Keypoint[], lastKps: Keypoint[] | null) {
-  if (!lastKps) return false;
+// // --- Simple movement-based idle detector -------------------------------
+// function detectIdle(kps: Keypoint[], lastKps: Keypoint[] | null) {
+//   if (!lastKps) return false;
 
-  let total = 0;
-  for (let i = 0; i < 17; i++) {
-    const dx = kps[i].x - lastKps[i].x;
-    const dy = kps[i].y - lastKps[i].y;
-    total += Math.hypot(dx, dy);
-  }
+//   let total = 0;
+//   for (let i = 0; i < 17; i++) {
+//     const dx = kps[i].x - lastKps[i].x;
+//     const dy = kps[i].y - lastKps[i].y;
+//     total += Math.hypot(dx, dy);
+//   }
 
-  // If the body moved less than this threshold, assume idle.
-  return total < 15;   // tweak 10–20 depending on sensitivity
-}
+//   // If the body moved less than this threshold, assume idle.
+//   return total < 15;   // tweak 10–20 depending on sensitivity
+// }
 
 /** Make a per-frame step function for the Layers model. */
 export function makeLayersStepper(model: tf.LayersModel, T = 60) {
