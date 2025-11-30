@@ -2,31 +2,62 @@
 import * as tf from '@tensorflow/tfjs';
 import type { Keypoint } from '@tensorflow-models/pose-detection';
 
-/** Path to TFJS Layers model */
 const DEFAULT_URL = '/models/gesture/model.json';
+export const LABELS = ['idle', 'raise_right', 'raise_left', 'cross_arms', 'both_arms_up'];
 
-/** Order must match training exactly */
-export const LABELS = [
-  'idle',
-  'raise_right',
-  'raise_left',
-  'cross_arms',
-  'both_arms_up',
-];
-
-export type GestureLabel = (typeof LABELS)[number];
-
-export interface GesturePrediction {
-  classIndex: number;
-  label: GestureLabel | `cls_${number}`;
-  confidence: number;
-  probs: number[];
-  nClasses: number;
+// Small logger that only warns once per message
+const warned = new Set<string>();
+function warnOnce(msg: string) {
+  if (!warned.has(msg)) {
+    console.warn(msg);
+    warned.add(msg);
+  }
 }
 
-/** Load the TFJS Layers model (Bi-GRU classifier) */
+// BlazePose-33 → COCO-17 subset mapping. Indices refer to BlazePose joints.
+const BLAZEPOSE33_TO_COCO17: number[] = [
+  0,     // nose
+  2, 3,  // left/right eye (approx)
+  7, 8,  // left/right ear (approx)
+  11, 12, // shoulders
+  13, 14, // elbows
+  15, 16, // wrists
+  23, 24, // hips
+  25, 26, // knees
+  27, 28, // ankles
+];
+
+// Ensure we have a 17-keypoint array in COCO order. Returns null if not possible.
+function toCoco17(kps: Keypoint[] | null | undefined): Keypoint[] | null {
+  if (!kps || kps.length === 0) return null;
+
+  // If we already have 17 keypoints, COCO-17 (MoveNet).
+  if (kps.length === 17) {
+    return kps;
+  }
+
+  // If detector returns BlazePose-33 or anything else, map down to COCO-17 subset.
+  if (kps.length >= 33) {
+    const out: Keypoint[] = [];
+    for (const idx of BLAZEPOSE33_TO_COCO17) {
+      const kp = kps[idx];
+      if (!kp) {
+        warnOnce('[gesture] Missing BlazePose keypoint while mapping to COCO-17');
+        return null;
+      }
+      out.push(kp);
+    }
+    return out;
+  }
+
+  warnOnce(`[gesture] Unsupported keypoint layout length=${kps.length}`);
+  return null;
+}
+
+// Model loading
 export async function loadGestureLayers(url = DEFAULT_URL) {
-  // Caller already sets backend + tf.ready() (LiveQuickTest, GestureStory)
+  await tf.setBackend('webgl');
+  await tf.ready();
   const model = await tf.loadLayersModel(url);
   console.log('Layers model loaded:', {
     in: model.inputs[0].shape,
@@ -35,187 +66,235 @@ export async function loadGestureLayers(url = DEFAULT_URL) {
   return model;
 }
 
-/** Per-frame normalization matching training pipeline:
- * torso-centered, shoulder-width scaled, 17 keypoints × (x,y,score) → [17,3]
- *
- * MoveNet COCO-17 layout:
- *  11 = left shoulder, 6 = right shoulder, 11 = left hip, 12 = right hip
+/**
+ * Per-frame normalization that matches with model training:
+ *  - Map to COCO-17
+ *  - Center on torso (average of shoulders and hips)
+ *  - Scale by shoulder width
+ *  - Keep (nx, ny, score) for each of the 17 joints → flat [51]
  */
-export function normalizeFrame(kps: Keypoint[]): number[] | null {
-  if (!kps || kps.length < 17) return null;
+function normalizeFrame(raw: Keypoint[]): number[] | null {
+  const kps = toCoco17(raw);
+  if (!kps || kps.length !== 17) {
+    warnOnce('[gesture] Skipping frame: keypoints not in COCO-17 layout yet');
+    return null;
+  }
 
-  // MoveNet COCO-17 indices
-  const Ls = kps[5];  // left shoulder
-  const Rs = kps[6];  // right shoulder
-  const Lh = kps[11]; // left hip
-  const Rh = kps[12]; // right hip
+  // Shoulders / hips in COCO-17
+  const Ls = kps[5];
+  const Rs = kps[6];
+  const Lh = kps[11];
+  const Rh = kps[12];
 
-  if (!Ls || !Rs || !Lh || !Rh) return null;
+  if (!Ls || !Rs || !Lh || !Rh) {
+    warnOnce('[gesture] Skipping frame: shoulders/hips missing');
+    return null;
+  }
 
-  const cx = (Ls.x + Rs.x + Lh.x + Rh.x) / 4;
-  const cy = (Ls.y + Rs.y + Lh.y + Rh.y) / 4;
-  const shoulderW = Math.hypot(Ls.x - Rs.x, Ls.y - Rs.y) || 1;
+  const sx1 = Ls.x ?? 0;
+  const sy1 = Ls.y ?? 0;
+  const sx2 = Rs.x ?? 0;
+  const sy2 = Rs.y ?? 0;
+
+  const hx1 = Lh.x ?? 0;
+  const hy1 = Lh.y ?? 0;
+  const hx2 = Rh.x ?? 0;
+  const hy2 = Rh.y ?? 0;
+
+  // Torso center: average of shoulders and hips
+  const cx = (sx1 + sx2 + hx1 + hx2) / 4;
+  const cy = (sy1 + sy2 + hy1 + hy2) / 4;
+
+  // Shoulder distance for scale (fallback to hip distance if too small)
+  let shoulderW = Math.hypot(sx1 - sx2, sy1 - sy2);
+  const hipW = Math.hypot(hx1 - hx2, hy1 - hy2);
+  if (!isFinite(shoulderW) || shoulderW < 1e-3) {
+    shoulderW = hipW;
+  }
+  if (!isFinite(shoulderW) || shoulderW < 1e-3) {
+    warnOnce('[gesture] Skipping frame: invalid shoulder/hip width');
+    return null;
+  }
 
   const out: number[] = [];
-  for (const kp of kps.slice(0, 17)) {
-    const nx = (kp.x - cx) / shoulderW;
-    const ny = (kp.y - cy) / shoulderW;
-    const sc = kp.score ?? 0;
-    out.push(nx, ny, sc);
+  for (const kp of kps) {
+    const x = kp.x ?? 0;
+    const y = kp.y ?? 0;
+    const score = kp.score ?? 0;
+
+    const nx = (x - cx) / shoulderW;
+    const ny = (y - cy) / shoulderW;
+
+    out.push(nx, ny, score);
+  }
+
+  return out; // length 51
+}
+
+/**
+ * Simple forward-style temporal smoothing:
+ *  - If a joint score is below the threshold, reuse the previous frame's (nx, ny)
+ *    for that joint.
+ *  - This approximates the forward/backward fill used in the Python preprocessing for our dataset,
+ *    but in a streaming way.
+ */
+function smoothFrameWithPrev(
+  curr: number[],
+  prev: number[],
+  scoreThreshold = 0.3,
+): number[] {
+  if (curr.length !== prev.length) return curr;
+
+  const out = curr.slice();
+
+  const jointCount = curr.length / 3;
+  for (let j = 0; j < jointCount; j++) {
+    const base = j * 3;
+    const score = curr[base + 2];
+
+    if (!Number.isFinite(score) || score < scoreThreshold) {
+      // Reuse previous (nx, ny). Keep the current score as-is.
+      out[base + 0] = prev[base + 0];
+      out[base + 1] = prev[base + 1];
+    }
   }
 
   return out;
 }
 
+/**
+ * Pose level idle detector on the normalized frame.
+ * Treat the pose as clearly idle when both wrists are comfortably
+ * below the shoulders with reasonable confidence.
+ */
+function isClearlyIdle(normFrame: number[]): boolean {
+  if (normFrame.length !== 17 * 3) return false;
 
-/** Simple sequence buffer to collect T frames and emit [1,T,17,3] tensor */
+  const lShoulderY = normFrame[5 * 3 + 1];
+  const rShoulderY = normFrame[6 * 3 + 1];
+  if (!Number.isFinite(lShoulderY) || !Number.isFinite(rShoulderY)) {
+    return false;
+  }
+  const shoulderY = (lShoulderY + rShoulderY) / 2;
+
+  const lWristY = normFrame[9 * 3 + 1];
+  const rWristY = normFrame[10 * 3 + 1];
+  const lWristScore = normFrame[9 * 3 + 2];
+  const rWristScore = normFrame[10 * 3 + 2];
+
+  const minScore = 0.5;
+  if (lWristScore < minScore || rWristScore < minScore) {
+    return false;
+  }
+
+  // Normalized coordinates keep y increasing downward.
+  // Idle arms down: wrists well below the shoulders.
+  const margin = 0.4;
+  if (lWristY > shoulderY + margin && rWristY > shoulderY + margin) {
+    return true;
+  }
+
+  return false;
+}
+
+// Sequence buffer
 class SeqBuf {
   private frames: number[][] = [];
-  private readonly T: number;
+  private lastFrame: number[] | null = null;
+  private T: number;
 
   constructor(T = 60) {
     this.T = T;
   }
 
-  push(f: number[] | null) {
+  /**
+   * Push a frame into the buffer.
+   * If repeat > 1, the same smoothed frame is pushed several times.
+   * This is used to flush idle frames through the window more quickly.
+   */
+  push(f: number[] | null, repeat = 1) {
     if (!f) return;
-    this.frames.push(f);
-    if (this.frames.length > this.T) this.frames.shift();
+
+    let frame = f;
+    if (this.lastFrame) {
+      frame = smoothFrameWithPrev(frame, this.lastFrame);
+    }
+
+    for (let r = 0; r < repeat; r++) {
+      this.frames.push(frame);
+      if (this.frames.length > this.T) {
+        this.frames.shift();
+      }
+    }
+
+    this.lastFrame = frame;
   }
 
   ready() {
     return this.frames.length === this.T;
   }
 
-  /** Returns a tensor shaped [1, T, 17, 3] as used in training. */
-  toTensor4D() {
-    const flat = this.frames.flat(); // length T*51
-    const T = this.frames.length;
-    return tf.tensor4d(flat, [1, T, 17, 3]);
-  }
-
-  reset() {
-    this.frames = [];
+  toTensor4D(): tf.Tensor4D | null {
+    if (!this.ready()) return null;
+    const flat = this.frames.flat(); // T * 51
+    return tf.tensor4d(flat, [1, this.frames.length, 17, 3]);
   }
 }
-
-// // --- Simple movement-based idle detector -------------------------------
-// function detectIdle(kps: Keypoint[], lastKps: Keypoint[] | null) {
-//   if (!lastKps) return false;
-
-//   let total = 0;
-//   for (let i = 0; i < 17; i++) {
-//     const dx = kps[i].x - lastKps[i].x;
-//     const dy = kps[i].y - lastKps[i].y;
-//     total += Math.hypot(dx, dy);
-//   }
-
-//   // If the body moved less than this threshold, assume idle.
-//   return total < 15;   // tweak 10–20 depending on sensitivity
-// }
 
 /** Make a per-frame step function for the Layers model. */
 export function makeLayersStepper(model: tf.LayersModel, T = 60) {
   const buf = new SeqBuf(T);
-  const nClasses =
-    (model.outputs[0].shape?.[1] as number) ?? LABELS.length;
+  const nClasses = (model.outputs[0].shape?.[1] as number) ?? LABELS.length;
 
-  // --- latency tracking (unchanged) ---
+  // latency tracking
   let total = 0;
   let count = 0;
 
-  // --- motion-based idle detection --------------------------
-  let lastNorm: number[] | null = null;
-  let stillStreak = 0;
-
-  // tune these vars for system testing
-  const MOTION_IDLE_THRESH = 0.02;   // avg movement per joint (normalized coords)
-  const STILL_FRAMES_FOR_IDLE = 8;   // how many very-still frames before idle is forced
-
   return (kps: Keypoint[]) => {
-    // normalize to [51] or null
     const norm = normalizeFrame(kps);
-    if (!norm) return null;
+    const isIdlePose = norm ? isClearlyIdle(norm) : false;
 
-    // --- compute motion magnitude between frames ---
-    let motion = 0;
-    if (lastNorm) {
-      let acc = 0;
-      const len = norm.length;
-      const jointCount = len / 3;
+    // When the pose is clearly idle, push multiple copies of this frame
+    // to flush gesture frames from the window more quickly and return state to idle.
+    const repeat = isIdlePose ? 4 : 1;
+    buf.push(norm, repeat);
 
-      for (let i = 0; i < len; i += 3) {
-        const dx = norm[i] - lastNorm[i];
-        const dy = norm[i + 1] - lastNorm[i + 1];
-        acc += Math.hypot(dx, dy);
-      }
-      motion = acc / jointCount;
-    }
-    lastNorm = norm;
-
-    const isVeryStill = motion > 0 && motion < MOTION_IDLE_THRESH;
-    if (isVeryStill) {
-      stillStreak++;
-    } else {
-      stillStreak = 0;
-    }
-
-    // push into temporal buffer
-    buf.push(norm);
     if (!buf.ready()) return null;
 
     const x = buf.toTensor4D();
+    if (!x) return null;
 
     const t0 = performance.now();
+
     const y = model.predict(x) as tf.Tensor;
-    const probsArr = Array.from(y.dataSync()); // <- define probs here
+    const probs = y.dataSync();
+
     const t1 = performance.now();
+    const elapsed = t1 - t0;
+
+    total += elapsed;
+    count++;
+    if (count % 50 === 0) {
+      console.log(`Average inference latency: ${(total / count).toFixed(2)} ms`);
+    }
 
     x.dispose();
     y.dispose();
 
-    const elapsed = t1 - t0;
-    total += elapsed;
-    count++;
-    if (count % 50 === 0) {
-      console.log(
-        `Average inference latency: ${(total / count).toFixed(2)} ms`
-      );
-    }
-
-    // argmax over probs
     let bestI = 0;
-    let bestP = probsArr[0] ?? 0;
-    for (let i = 1; i < probsArr.length; i++) {
-      if (probsArr[i] > bestP) {
-        bestP = probsArr[i];
+    let bestP = probs[0] ?? 0;
+    for (let i = 1; i < probs.length; i++) {
+      if (probs[i] > bestP) {
+        bestP = probs[i];
         bestI = i;
       }
     }
 
-    // --- motion-based idle override ---------------------------------
-    // index 0 in LABELS is 'idle' in your setup
-    const IDLE_INDEX = 0;
-
-    const forceIdle = stillStreak >= STILL_FRAMES_FOR_IDLE;
-
-    let finalLabel: any;
-    let finalConf: number;
-
-    if (forceIdle) {
-      finalLabel = 'idle';
-      finalConf = 1.0;
-      bestI = IDLE_INDEX;
-    } else {
-      finalLabel = (LABELS[bestI] ?? `cls_${bestI}`) as any;
-      finalConf = bestP;
-    }
-
     return {
       classIndex: bestI,
-      label: finalLabel,
-      confidence: finalConf,
-      probs: probsArr,
+      label: LABELS[bestI] ?? `cls_${bestI}`,
+      confidence: bestP,
+      probs,
       nClasses,
     };
   };
