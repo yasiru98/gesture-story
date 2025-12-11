@@ -55,14 +55,59 @@ function toCoco17(kps: Keypoint[] | null | undefined): Keypoint[] | null {
 }
 
 // Model loading
-export async function loadGestureLayers(url = DEFAULT_URL) {
-  await tf.setBackend('webgl');
+export async function loadGestureLayers(url: string = DEFAULT_URL) {
+  const t0 = performance.now();
+
+  await tf.setBackend("webgl");
   await tf.ready();
+  const tBackendReady = performance.now();
+
   const model = await tf.loadLayersModel(url);
-  console.log('Layers model loaded:', {
-    in: model.inputs[0].shape,
-    out: model.outputs[0].shape,
+  const tModelLoaded = performance.now();
+
+  // ---------- Warm-up inference timing ----------
+  const tInfer0 = performance.now();
+
+  // Force TensorFlow.js to execute a real shader path
+  const warmupOut = model.predict(tf.zeros([1, 60, 17, 3])) as tf.Tensor;
+  await warmupOut.data();
+
+  const tInfer1 = performance.now();
+  const warmupMs = tInfer1 - tInfer0;
+  
+  console.log("[GestureStory] Warm-up inference ms:", warmupMs.toFixed(2));
+  // ----------------------------------------------
+
+  const backend = tf.getBackend();
+  const initMs = tBackendReady - t0;
+  const loadMs = tModelLoaded - tBackendReady;
+  const totalMs = tModelLoaded - t0;
+
+  // Try to grab network info, if available in the Performance API
+  const entries = performance.getEntriesByName(url);
+  const resource = entries.length > 0 ? entries[0] as PerformanceResourceTiming : null;
+
+  console.log("[GestureStory] Layers model loaded:", {
+    backend,
+    inputShape: model.inputs[0].shape,
+    outputShape: model.outputs[0].shape,
+    timingMs: {
+      backendInit: initMs.toFixed(2),
+      modelLoad: loadMs.toFixed(2),
+      total: totalMs.toFixed(2),
+    },
+    bytesTransferred: resource ? resource.transferSize : "n/a",
+    encodedBodySize: resource ? resource.encodedBodySize : "n/a",
   });
+
+  // Optional: stash for later inspection in devtools
+  (window as any).__gestureModelProfile = {
+    backend,
+    timingMs: { backendInit: initMs, modelLoad: loadMs, total: totalMs },
+    bytesTransferred: resource ? resource.transferSize : null,
+    encodedBodySize: resource ? resource.encodedBodySize : null,
+  };
+
   return model;
 }
 
