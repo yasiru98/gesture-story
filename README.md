@@ -74,20 +74,19 @@ src/
 
   pages/
     GestureStory.tsx       — main page: webcam → pipeline → UI
-    DebugPose.tsx          — pose keypoint visualiser
-    LiveQuickTest.tsx      — gesture label live tester
-    ModelSmokeTest.tsx     — model load + inference sanity check
 
   ai/
     layersModel.ts         — model loading, frame normalisation, SeqBuf, stepper
     gestureToEvent.ts      — GestureEventSmoother, gesture→StoryEvent mapping
-    heuristics.ts          — earlier rule-based detector (reference only, unused)
-    worker.ts              — reserved
+    heuristics.ts          — heuristic(rule-based) detector (reference only, not used in production)
 
   state/
     storyMachine.ts        — XState v5 finite state machine (8 states, 4 event types)
 
-  storyGraph.json          — narrative graph data
+  dev/                     — development and testing tools (not routed in production)
+    DebugPose.tsx          — live pose keypoint visualiser with heuristic overlay
+    LiveQuickTest.tsx      — live gesture label + confidence tester
+    ModelSmokeTest.tsx     — model load + single forward-pass sanity check
 
 public/
   assets/                  — gesture reference images (shown in the gesture guide)

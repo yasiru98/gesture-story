@@ -3,7 +3,7 @@ import * as tf from '@tensorflow/tfjs-core';
 import '@tensorflow/tfjs-backend-webgl';
 import * as poseDetection from '@tensorflow-models/pose-detection';
 import type { Pose } from '@tensorflow-models/pose-detection';
-import { detectGesture } from '../ai/heuristics'; // your file
+import { detectGesture } from '../ai/heuristics';
 
 export default function DebugPose() {
   const videoRef  = useRef<HTMLVideoElement>(null);

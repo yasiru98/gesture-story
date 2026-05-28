@@ -1,4 +1,4 @@
-// src/pages/ModelSmokeTest.tsx
+// src/dev/ModelSmokeTest.tsx
 import { useEffect, useState } from 'react';
 import * as tf from '@tensorflow/tfjs';
 import { loadGestureLayers, LABELS } from '../ai/layersModel';
