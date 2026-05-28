@@ -1,1 +1,6 @@
 /* Global overrides — component styles live in index.css (Tailwind) or inline */
+
+#root {
+  text-align: center;
+  width: 100%;
+}
